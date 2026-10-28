@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Accepte les invitations GitHub en attente et les journalise.
 
-Chaque exécution accepte les invitations de dépôt et d'organisation du
-compte authentifié, puis ajoute une ligne à ``invitations_acceptees.csv``.
-Relancer le programme accepte aussi les invitations arrivées entre-temps.
+Chaque exécution interroge GitHub, accepte les invitations encore en
+attente, puis ajoute une ligne à ``invitations_acceptees.csv``.
+Relancer le programme prend aussi les invitations arrivées entre-temps.
 
-Le profil GitHub ne sépare pas le prénom du nom, et l'e-mail n'est lisible
-que s'il est public. Le journal laisse le champ vide et l'explique dans
-``remarque`` quand GitHub ne le publie pas.
+Le pseudo, le nom, l'e-mail et les autres champs publics sont remplis
+seulement quand GitHub les publie. Un champ absent reste vide. Une fiche
+incomplète, illisible ou inaccessible n'arrête pas le reste du traitement.
 """
 
 from __future__ import annotations
@@ -20,16 +20,18 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from urllib.parse import quote
 
 
 REPERTOIRE = Path(__file__).resolve().parent
 JOURNAL_DEFAUT = REPERTOIRE / "invitations_acceptees.csv"
 
-# Colonnes stables : les quatre demandées, plus de quoi identifier l'invitation.
+# Le pseudo, le nom et l'e-mail restent les colonnes demandées.
+# Les champs suivants sont les autres infos publiques du profil, souvent vides.
 COLONNES_JOURNAL = (
     "horodatage_utc",
     "id_invitation",
@@ -39,7 +41,14 @@ COLONNES_JOURNAL = (
     "username",
     "prenom",
     "nom",
+    "nom_complet",
     "email",
+    "bio",
+    "entreprise",
+    "lieu",
+    "blog",
+    "twitter",
+    "url_profil",
     "remarque",
 )
 
@@ -59,6 +68,24 @@ class ErreurGitHub(Exception):
         self.statut = statut
 
 
+def texte(valeur: object) -> str:
+    """Texte affichable. ``None``, booléen ou structure deviennent une chaîne vide."""
+
+    if isinstance(valeur, str):
+        return valeur.strip()
+    if isinstance(valeur, bool) or valeur is None:
+        return ""
+    if isinstance(valeur, (int, float)):
+        return str(valeur).strip()
+    return ""
+
+
+def dictionnaire(valeur: object) -> dict:
+    """Objet JSON. Toute autre forme est traitée comme un objet vide."""
+
+    return valeur if isinstance(valeur, dict) else {}
+
+
 def jetons_disponibles() -> list[str]:
     """Jetons du compte, sans jamais les afficher.
 
@@ -69,7 +96,7 @@ def jetons_disponibles() -> list[str]:
 
     trouves: list[str] = []
     for nom in ("GITHUB_TOKEN", "GH_TOKEN"):
-        valeur = os.environ.get(nom, "").strip()
+        valeur = texte(os.environ.get(nom))
         if valeur and valeur not in trouves:
             trouves.append(valeur)
     environnement = os.environ.copy()
@@ -82,11 +109,12 @@ def jetons_disponibles() -> list[str]:
             capture_output=True,
             text=True,
             env=environnement,
+            timeout=20,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.SubprocessError):
         resultat = None
     if resultat is not None:
-        jeton = resultat.stdout.strip()
+        jeton = texte(resultat.stdout)
         if jeton and jeton not in trouves:
             trouves.append(jeton)
     if not trouves:
@@ -106,13 +134,13 @@ def separer_prenom_nom(nom_complet: str) -> tuple[str, str]:
     est le prénom et le reste est le nom. Un seul mot reste le prénom.
     """
 
-    texte = " ".join(nom_complet.split())
-    if not texte:
+    texte_nom = " ".join(texte(nom_complet).split())
+    if not texte_nom:
         return "", ""
-    if "," in texte:
-        gauche, _, droite = texte.partition(",")
+    if "," in texte_nom:
+        gauche, _, droite = texte_nom.partition(",")
         return " ".join(droite.split()), " ".join(gauche.split())
-    mots = texte.split(" ")
+    mots = texte_nom.split(" ")
     if len(mots) == 1:
         return mots[0], ""
     return mots[0], " ".join(mots[1:])
@@ -120,42 +148,76 @@ def separer_prenom_nom(nom_complet: str) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class ProfilExpediteur:
-    """Identité publique de la personne qui a envoyé l'invitation."""
+    """Infos publiques de la personne qui a envoyé l'invitation.
+
+    Chaque attribut peut rester vide. GitHub ne publie pas forcément le nom
+    ni l'e-mail, et une invitation d'organisation ne nomme pas l'expéditeur.
+    """
 
     username: str
     prenom: str
     nom: str
-    email: str
     nom_complet: str
+    email: str
+    bio: str
+    entreprise: str
+    lieu: str
+    blog: str
+    twitter: str
+    url_profil: str
 
     @classmethod
-    def depuis_profil_public(cls, brut: dict) -> ProfilExpediteur:
-        """Construit le profil depuis ``GET /users/{username}``."""
-
-        nom_complet = (brut.get("name") or "").strip()
-        prenom, nom = separer_prenom_nom(nom_complet)
-        return cls(
-            username=(brut.get("login") or "").strip(),
-            prenom=prenom,
-            nom=nom,
-            email=(brut.get("email") or "").strip(),
-            nom_complet=nom_complet,
-        )
-
-    @classmethod
-    def sans_profil(cls, username: str) -> ProfilExpediteur:
-        """Username connu, profil public illisible ou absent."""
+    def vide(cls, username: str = "") -> ProfilExpediteur:
+        """Profil sans donnée publique, avec le pseudo si on le connaît déjà."""
 
         return cls(
-            username=username.strip(),
+            username=texte(username),
             prenom="",
             nom="",
-            email="",
             nom_complet="",
+            email="",
+            bio="",
+            entreprise="",
+            lieu="",
+            blog="",
+            twitter="",
+            url_profil="",
         )
 
+    @classmethod
+    def depuis_profil_public(
+        cls,
+        brut: object,
+        username_secours: str = "",
+    ) -> ProfilExpediteur:
+        """Construit le profil depuis ``GET /users/{username}``.
+
+        Une réponse inattendue donne un profil vide plutôt qu'une exception.
+        Le pseudo déjà connu est conservé si la réponse ne le répète pas.
+        """
+
+        try:
+            donnees = dictionnaire(brut)
+            nom_complet = texte(donnees.get("name"))
+            prenom, nom = separer_prenom_nom(nom_complet)
+            return cls(
+                username=texte(donnees.get("login")) or texte(username_secours),
+                prenom=prenom,
+                nom=nom,
+                nom_complet=nom_complet,
+                email=texte(donnees.get("email")),
+                bio=texte(donnees.get("bio")),
+                entreprise=texte(donnees.get("company")),
+                lieu=texte(donnees.get("location")),
+                blog=texte(donnees.get("blog")),
+                twitter=texte(donnees.get("twitter_username")),
+                url_profil=texte(donnees.get("html_url")),
+            )
+        except (TypeError, ValueError, AttributeError):
+            return cls.vide(username_secours)
+
     def remarque(self, expediteur_inconnu: bool = False) -> str:
-        """Explique les champs laissés vides. Chaîne vide si tout est là."""
+        """Explique les champs d'identité laissés vides. Chaîne vide si tout est là."""
 
         if expediteur_inconnu:
             return (
@@ -186,34 +248,36 @@ class Invitation:
     expiree: bool
 
     @classmethod
-    def depuis_depot(cls, brut: dict) -> Invitation:
+    def depuis_depot(cls, brut: object) -> Invitation:
         """Mappe un objet de ``GET /user/repository_invitations``."""
 
-        depot = brut.get("repository") or {}
-        expediteur = brut.get("inviter") or {}
+        donnees = dictionnaire(brut)
+        depot = dictionnaire(donnees.get("repository"))
+        expediteur = dictionnaire(donnees.get("inviter"))
         return cls(
-            identifiant=str(brut.get("id") or ""),
+            identifiant=texte(donnees.get("id")),
             type=TypeInvitation.DEPOT,
-            cible=(depot.get("full_name") or "").strip(),
-            permission=(brut.get("permissions") or "").strip(),
-            username_expediteur=(expediteur.get("login") or "").strip(),
-            expiree=bool(brut.get("expired")),
+            cible=texte(depot.get("full_name")),
+            permission=texte(donnees.get("permissions")),
+            username_expediteur=texte(expediteur.get("login")),
+            expiree=donnees.get("expired") is True,
         )
 
     @classmethod
-    def depuis_organisation(cls, brut: dict) -> Invitation:
+    def depuis_organisation(cls, brut: object) -> Invitation:
         """Mappe un objet de ``GET /user/memberships/orgs?state=pending``.
 
         Cette réponse décrit l'organisation, pas la personne qui a invité.
         """
 
-        organisation = brut.get("organization") or {}
-        login = (organisation.get("login") or "").strip()
+        donnees = dictionnaire(brut)
+        organisation = dictionnaire(donnees.get("organization"))
+        login = texte(organisation.get("login"))
         return cls(
             identifiant=f"org:{login}" if login else "org:",
             type=TypeInvitation.ORGANISATION,
             cible=login,
-            permission=(brut.get("role") or "").strip(),
+            permission=texte(donnees.get("role")),
             username_expediteur="",
             expiree=False,
         )
@@ -230,9 +294,9 @@ class ClientGitHub:
             jetons = [jetons]
         propres: list[str] = []
         for jeton in jetons:
-            jeton = jeton.strip()
-            if jeton and jeton not in propres:
-                propres.append(jeton)
+            valeur = texte(jeton)
+            if valeur and valeur not in propres:
+                propres.append(valeur)
         if not propres:
             raise ErreurGitHub("Le jeton GitHub est vide.")
         self._jetons = propres
@@ -241,36 +305,41 @@ class ClientGitHub:
         self._secours_annonce = False
 
     def lister_invitations(self) -> list[Invitation]:
-        """Invitations de dépôt, puis invitations d'organisation."""
+        """Invitations lisibles. Une liste en échec ne supprime pas l'autre."""
 
-        depots = [
-            Invitation.depuis_depot(objet)
-            for objet in self._pages("/user/repository_invitations")
-        ]
-        organisations = [
-            Invitation.depuis_organisation(objet)
-            for objet in self._pages("/user/memberships/orgs?state=pending")
-        ]
+        depots = self._lire_invitations(
+            "/user/repository_invitations",
+            Invitation.depuis_depot,
+        )
+        organisations = self._lire_invitations(
+            "/user/memberships/orgs?state=pending",
+            Invitation.depuis_organisation,
+        )
         return depots + organisations
 
     def profil_expediteur(self, username: str) -> ProfilExpediteur:
-        """Profil public, mis en cache. Un échec ne bloque pas l'acceptation."""
+        """Profil public, mis en cache.
 
-        cle = username.strip()
+        Si GitHub ne répond pas ou cache le profil, le pseudo est conservé
+        et les autres champs restent vides. L'acceptation continue.
+        """
+
+        cle = texte(username)
         if not cle:
-            return ProfilExpediteur.sans_profil("")
+            return ProfilExpediteur.vide()
         if cle in self._profils:
             return self._profils[cle]
         try:
-            charge = self._json("GET", f"/users/{cle}")
-        except ErreurGitHub:
-            profil = ProfilExpediteur.sans_profil(cle)
-        else:
-            profil = (
-                ProfilExpediteur.depuis_profil_public(charge)
-                if isinstance(charge, dict)
-                else ProfilExpediteur.sans_profil(cle)
+            charge = self._json("GET", "/users/" + quote(cle, safe=""))
+            profil = ProfilExpediteur.depuis_profil_public(charge, cle)
+        except Exception as exc:
+            print(
+                f"Profil public indisponible pour {cle} : {exc}",
+                file=sys.stderr,
             )
+            profil = ProfilExpediteur.vide(cle)
+        if not profil.username:
+            profil = replace(profil, username=cle)
         self._profils[cle] = profil
         return profil
 
@@ -282,16 +351,32 @@ class ClientGitHub:
                 raise ErreurGitHub("Invitation de dépôt sans identifiant.")
             self._json(
                 "PATCH",
-                f"/user/repository_invitations/{invitation.identifiant}",
+                f"/user/repository_invitations/{quote(invitation.identifiant, safe='')}",
             )
             return
         if not invitation.cible:
             raise ErreurGitHub("Invitation d'organisation sans nom.")
         self._json(
             "PATCH",
-            f"/user/memberships/orgs/{invitation.cible}",
+            f"/user/memberships/orgs/{quote(invitation.cible, safe='')}",
             {"state": "active"},
         )
+
+    def _lire_invitations(self, chemin: str, fabrique) -> list[Invitation]:
+        """Convertit une page d'API. Un élément illisible est ignoré."""
+
+        try:
+            objets = self._pages(chemin)
+        except ErreurGitHub as exc:
+            print(f"Liste indisponible ({chemin}) : {exc}", file=sys.stderr)
+            return []
+        invitations: list[Invitation] = []
+        for objet in objets:
+            try:
+                invitations.append(fabrique(objet))
+            except (TypeError, ValueError, AttributeError) as exc:
+                print(f"Invitation illisible, ignorée : {exc}", file=sys.stderr)
+        return invitations
 
     def _pages(self, chemin: str) -> list[dict]:
         """Suit ``Link: rel=next`` jusqu'à la dernière page."""
@@ -299,12 +384,16 @@ class ClientGitHub:
         resultats: list[dict] = []
         separateur = "&" if "?" in chemin else "?"
         url: str | None = f"{chemin}{separateur}per_page=100"
-        while url:
-            charge, lien_suivant = self._json_et_suivant("GET", url)
+        deja_vues: set[str] = set()
+        while url and url not in deja_vues:
+            deja_vues.add(url)
+            charge, lien = self._json_et_suivant("GET", url)
+            if charge is None:
+                break
             if not isinstance(charge, list):
                 raise ErreurGitHub(f"Liste attendue pour {chemin}.")
             resultats.extend(objet for objet in charge if isinstance(objet, dict))
-            url = lien_suivant
+            url = lien
         return resultats
 
     def _json(
@@ -378,23 +467,26 @@ class ClientGitHub:
             ) from exc
         except urllib.error.URLError as exc:
             raise ErreurGitHub(f"Réseau indisponible : {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise ErreurGitHub("GitHub n'a pas répondu à temps.") from exc
         if not brut:
             return None, suivant
         try:
             return json.loads(brut.decode("utf-8")), suivant
-        except json.JSONDecodeError as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ErreurGitHub("Réponse GitHub illisible.") from exc
 
 
-def lien_suivant(entete: str | None) -> str | None:
+def lien_suivant(entete: object) -> str | None:
     """Extrait l'URL ``rel="next"`` de l'en-tête ``Link``."""
 
-    if not entete:
+    valeur = texte(entete)
+    if not valeur:
         return None
-    for morceau in entete.split(","):
+    for morceau in valeur.split(","):
         url, _, relation = morceau.partition(";")
         if 'rel="next"' in relation:
-            return url.strip().lstrip("<").rstrip(">")
+            return url.strip().lstrip("<").rstrip(">") or None
     return None
 
 
@@ -408,7 +500,7 @@ def message_erreur(brut: bytes) -> str:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return "réponse illisible"
     if isinstance(charge, dict) and charge.get("message"):
-        return str(charge["message"])
+        return texte(charge.get("message")) or "erreur sans message"
     return "erreur sans message"
 
 
@@ -419,16 +511,57 @@ class JournalInvitations:
         self.chemin = chemin
 
     def enregistrer(self, ligne: dict[str, str]) -> None:
-        """Ajoute une ligne. Écrit l'en-tête si le fichier est nouveau ou vide."""
+        """Ajoute une ligne. Écrit l'en-tête si le fichier est nouveau ou vide.
+
+        Un ancien journal, avec moins de colonnes, est réécrit une fois pour
+        garder ses lignes et ajouter les nouvelles colonnes vides.
+        """
 
         self.chemin.parent.mkdir(parents=True, exist_ok=True)
+        self._aligner_entete()
         nouveau = not self.chemin.exists() or self.chemin.stat().st_size == 0
         with self.chemin.open("a", encoding="utf-8", newline="") as fichier:
-            ecrivain = csv.DictWriter(fichier, fieldnames=COLONNES_JOURNAL)
+            ecrivain = csv.DictWriter(
+                fichier,
+                fieldnames=COLONNES_JOURNAL,
+                extrasaction="ignore",
+            )
             if nouveau:
                 ecrivain.writeheader()
-            ecrivain.writerow({colonne: ligne.get(colonne, "") for colonne in COLONNES_JOURNAL})
+            ecrivain.writerow(
+                {colonne: texte(ligne.get(colonne, "")) for colonne in COLONNES_JOURNAL}
+            )
             fichier.flush()
+
+    def _aligner_entete(self) -> None:
+        if not self.chemin.exists() or self.chemin.stat().st_size == 0:
+            return
+        with self.chemin.open(encoding="utf-8", newline="") as fichier:
+            try:
+                entete = next(csv.reader(fichier), None)
+            except csv.Error:
+                return
+        if entete is None or tuple(entete) == COLONNES_JOURNAL:
+            return
+        with self.chemin.open(encoding="utf-8", newline="") as fichier:
+            try:
+                anciennes = list(csv.DictReader(fichier))
+            except csv.Error:
+                return
+        with self.chemin.open("w", encoding="utf-8", newline="") as fichier:
+            ecrivain = csv.DictWriter(
+                fichier,
+                fieldnames=COLONNES_JOURNAL,
+                extrasaction="ignore",
+            )
+            ecrivain.writeheader()
+            for ancienne in anciennes:
+                ecrivain.writerow(
+                    {
+                        colonne: texte(ancienne.get(colonne, ""))
+                        for colonne in COLONNES_JOURNAL
+                    }
+                )
 
 
 class AccepteurInvitations:
@@ -462,7 +595,16 @@ class AccepteurInvitations:
 
         echecs = 0
         for invitation in actives:
-            if not self._traiter(invitation):
+            try:
+                reussi = self._traiter(invitation)
+            except Exception as exc:
+                print(
+                    f"- échec : {invitation.type.value} {invitation.cible or '—'} "
+                    f"({exc})",
+                    file=sys.stderr,
+                )
+                reussi = False
+            if not reussi:
                 echecs += 1
         if not self._simuler:
             print(f"Journal : {self._journal.chemin}")
@@ -487,12 +629,15 @@ class AccepteurInvitations:
         ligne = self._ligne(invitation, profil, expediteur_inconnu)
         try:
             self._journal.enregistrer(ligne)
-        except OSError as exc:
+        except (OSError, csv.Error) as exc:
             print(
                 f"Acceptée, mais le journal n'a pas pu être écrit : {exc}",
                 file=sys.stderr,
             )
-            print(",".join(ligne[colonne] for colonne in COLONNES_JOURNAL), file=sys.stderr)
+            print(
+                ",".join(texte(ligne.get(colonne, "")) for colonne in COLONNES_JOURNAL),
+                file=sys.stderr,
+            )
             return False
         self._afficher(invitation, profil, "acceptée")
         return True
@@ -505,15 +650,22 @@ class AccepteurInvitations:
     ) -> dict[str, str]:
         return {
             "horodatage_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "id_invitation": invitation.identifiant,
+            "id_invitation": texte(invitation.identifiant),
             "type": invitation.type.value,
-            "cible": invitation.cible,
-            "permission": invitation.permission,
-            "username": profil.username,
-            "prenom": profil.prenom,
-            "nom": profil.nom,
-            "email": profil.email,
-            "remarque": profil.remarque(expediteur_inconnu),
+            "cible": texte(invitation.cible),
+            "permission": texte(invitation.permission),
+            "username": texte(profil.username),
+            "prenom": texte(profil.prenom),
+            "nom": texte(profil.nom),
+            "nom_complet": texte(profil.nom_complet),
+            "email": texte(profil.email),
+            "bio": texte(profil.bio),
+            "entreprise": texte(profil.entreprise),
+            "lieu": texte(profil.lieu),
+            "blog": texte(profil.blog),
+            "twitter": texte(profil.twitter),
+            "url_profil": texte(profil.url_profil),
+            "remarque": texte(profil.remarque(expediteur_inconnu)),
         }
 
     def _afficher(
@@ -523,8 +675,8 @@ class AccepteurInvitations:
         etat: str,
     ) -> None:
         print(
-            f"- {etat} : {invitation.type.value} {invitation.cible} "
-            f"({invitation.permission}) | "
+            f"- {etat} : {invitation.type.value} {invitation.cible or '—'} "
+            f"({invitation.permission or '—'}) | "
             f"username={profil.username or '—'} "
             f"prenom={profil.prenom or '—'} "
             f"nom={profil.nom or '—'} "
@@ -536,7 +688,7 @@ def analyser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     analyseur = argparse.ArgumentParser(
         description=(
             "Accepte les invitations GitHub en attente et enregistre "
-            "username, prénom, nom et e-mail public de l'expéditeur."
+            "le pseudo, le nom, l'e-mail et les infos publiques disponibles."
         )
     )
     analyseur.add_argument(
@@ -554,8 +706,8 @@ def analyser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    options = analyser_arguments(argv)
     try:
+        options = analyser_arguments(argv)
         accepteur = AccepteurInvitations(
             ClientGitHub(jetons_disponibles()),
             JournalInvitations(options.journal),
@@ -565,6 +717,9 @@ def main(argv: list[str] | None = None) -> int:
     except ErreurGitHub as exc:
         print(f"Erreur : {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:
+        print(f"Erreur inattendue : {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
