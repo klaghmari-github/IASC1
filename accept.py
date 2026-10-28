@@ -505,63 +505,96 @@ def message_erreur(brut: bytes) -> str:
 
 
 class JournalInvitations:
-    """CSV ajouté en fin de fichier. Seules les acceptations réussies y entrent."""
+    """Historique des acceptations. Chaque appel ajoute une ligne en bas.
+
+    Le fichier existant n'est jamais ouvert en écriture tronquée. Une nouvelle
+    exécution conserve donc toutes les lignes déjà présentes.
+    """
 
     def __init__(self, chemin: Path) -> None:
         self.chemin = chemin
 
     def enregistrer(self, ligne: dict[str, str]) -> None:
-        """Ajoute une ligne. Écrit l'en-tête si le fichier est nouveau ou vide.
-
-        Un ancien journal, avec moins de colonnes, est réécrit une fois pour
-        garder ses lignes et ajouter les nouvelles colonnes vides.
-        """
+        """Ajoute une ligne à la fin. L'en-tête n'est écrit que si le fichier est vide."""
 
         self.chemin.parent.mkdir(parents=True, exist_ok=True)
-        self._aligner_entete()
-        nouveau = not self.chemin.exists() or self.chemin.stat().st_size == 0
+        self._etendre_colonnes_sans_perte()
+        avant = self._compter_donnees()
+        fichier_vide = not self.chemin.exists() or self.chemin.stat().st_size == 0
         with self.chemin.open("a", encoding="utf-8", newline="") as fichier:
             ecrivain = csv.DictWriter(
                 fichier,
                 fieldnames=COLONNES_JOURNAL,
                 extrasaction="ignore",
+                lineterminator="\n",
             )
-            if nouveau:
+            if fichier_vide:
                 ecrivain.writeheader()
             ecrivain.writerow(
                 {colonne: texte(ligne.get(colonne, "")) for colonne in COLONNES_JOURNAL}
             )
             fichier.flush()
+            os.fsync(fichier.fileno())
+        if avant is not None and self._compter_donnees() != avant + 1:
+            raise OSError("Le journal n'a pas conservé les lignes déjà présentes.")
 
-    def _aligner_entete(self) -> None:
-        if not self.chemin.exists() or self.chemin.stat().st_size == 0:
+    def _etendre_colonnes_sans_perte(self) -> None:
+        """Ajoute les colonnes manquantes en gardant chaque ligne déjà écrite.
+
+        La copie passe par un fichier temporaire. L'original n'est remplacé
+        que si toutes ses lignes de données s'y retrouvent.
+        """
+
+        lignes = self._lire_lignes()
+        if not lignes:
             return
-        with self.chemin.open(encoding="utf-8", newline="") as fichier:
-            try:
-                entete = next(csv.reader(fichier), None)
-            except csv.Error:
-                return
-        if entete is None or tuple(entete) == COLONNES_JOURNAL:
+        if tuple(lignes[0]) == COLONNES_JOURNAL:
             return
-        with self.chemin.open(encoding="utf-8", newline="") as fichier:
-            try:
-                anciennes = list(csv.DictReader(fichier))
-            except csv.Error:
-                return
-        with self.chemin.open("w", encoding="utf-8", newline="") as fichier:
+        entete = lignes[0]
+        donnees = lignes[1:]
+        temporaire = self.chemin.with_name(self.chemin.name + ".tmp")
+        with temporaire.open("w", encoding="utf-8", newline="") as fichier:
             ecrivain = csv.DictWriter(
                 fichier,
                 fieldnames=COLONNES_JOURNAL,
                 extrasaction="ignore",
+                lineterminator="\n",
             )
             ecrivain.writeheader()
-            for ancienne in anciennes:
+            for brute in donnees:
+                ancienne = {
+                    entete[indice]: brute[indice] if indice < len(brute) else ""
+                    for indice in range(len(entete))
+                }
                 ecrivain.writerow(
                     {
                         colonne: texte(ancienne.get(colonne, ""))
                         for colonne in COLONNES_JOURNAL
                     }
                 )
+            fichier.flush()
+            os.fsync(fichier.fileno())
+        relues = self._lire_lignes(temporaire)
+        if relues is None or len(relues) != len(donnees) + 1:
+            temporaire.unlink(missing_ok=True)
+            return
+        os.replace(temporaire, self.chemin)
+
+    def _compter_donnees(self) -> int | None:
+        lignes = self._lire_lignes()
+        if lignes is None:
+            return None
+        return max(len(lignes) - 1, 0)
+
+    def _lire_lignes(self, chemin: Path | None = None) -> list[list[str]] | None:
+        cible = self.chemin if chemin is None else chemin
+        if not cible.exists() or cible.stat().st_size == 0:
+            return []
+        try:
+            with cible.open(encoding="utf-8", newline="") as fichier:
+                return list(csv.reader(fichier))
+        except (OSError, csv.Error):
+            return None
 
 
 class AccepteurInvitations:
